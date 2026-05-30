@@ -1,0 +1,13 @@
+[Unit]
+Description=watchdocker weekly auto-update
+Documentation=https://github.com/cipherfoxie/watchdocker
+
+[Timer]
+# Sundays at 03:00 local time, with jitter to avoid thundering-herd
+OnCalendar=Sun 03:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=watchdocker.service
+
+[Install]
+WantedBy=timers.target

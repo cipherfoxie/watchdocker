@@ -1,0 +1,56 @@
+[Unit]
+Description=watchdocker — sovereign Docker Compose auto-updater
+Documentation=https://github.com/cipherfoxie/watchdocker
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/watchdocker
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30min
+
+# ── Sandboxing ───────────────────────────────────────────────────────────
+# We must talk to the docker daemon (writable socket) and read config/projects.
+# Everything else is locked down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+PrivateTmp=true
+PrivateDevices=true
+RemoveIPC=true
+
+# Required writable paths
+RuntimeDirectory=watchdocker
+RuntimeDirectoryMode=0750
+ReadWritePaths=/var/run/docker.sock /run/watchdocker
+
+# Network access: docker pull needs it
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# System-call whitelist (allow common docker-talking shape)
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap
+
+# Capabilities: none beyond what docker.sock auth grants
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+# watchdocker — sovereign Docker Compose auto-updater
+# Pure bash, zero runtime deps. Replaces archived containrrr/watchtower.
+#
+# See README.md for design constraints and SECURITY.md for the threat model.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly VERSION="0.1.0"
+readonly DEFAULT_CONFIG="${WATCHDOCKER_CONFIG:-/etc/watchdocker/config.yaml}"
+readonly LOCKDIR="${WATCHDOCKER_LOCKDIR:-/run/watchdocker/lock}"
+
+# ── State (writable) ──────────────────────────────────────────────────────
+declare -i DRY_RUN=0
+declare -i VERBOSE=0
+declare -i FORCE_ONCE=0
+declare -i LIST_ONLY=0
+CONFIG="$DEFAULT_CONFIG"
+declare -a PROJECTS=()
+declare -a SKIP_PROJECTS=()
+PRE_HOOK=""
+POST_HOOK=""
+PRUNE_AGE="168h"
+declare -i PRUNE_ENABLED=1
+
+# Stats (initialized to zero up-front so early returns can read them)
+declare -i STATS_UPDATED=0
+declare -i STATS_UNCHANGED=0
+declare -i STATS_SKIPPED=0
+declare -i STATS_FAILED=0
+declare -i STATS_MISSING=0
+declare -i STATS_DRY=0
+
+# ── ANSI colors (only when stdout is a TTY) ───────────────────────────────
+if [[ -t 1 ]]; then
+    readonly C_RED=$'\e[31m'
+    readonly C_GREEN=$'\e[32m'
+    readonly C_YELLOW=$'\e[33m'
+    readonly C_BLUE=$'\e[34m'
+    readonly C_BOLD=$'\e[1m'
+    readonly C_RESET=$'\e[0m'
+else
+    readonly C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_BOLD="" C_RESET=""
+fi
+
+# ── Logging ───────────────────────────────────────────────────────────────
+log()  { printf '%(%H:%M:%S)T [INFO]  %s\n' -1 "$*"; }
+warn() { printf '%(%H:%M:%S)T [WARN]  %s%s%s\n' -1 "$C_YELLOW" "$*" "$C_RESET" >&2; }
+err()  { printf '%(%H:%M:%S)T [ERROR] %s%s%s\n' -1 "$C_RED" "$*" "$C_RESET" >&2; }
+dbg()  { (( VERBOSE )) && printf '%(%H:%M:%S)T [DEBUG] %s\n' -1 "$*" >&2 || true; }
+
+# ── Fatal-error trap ──────────────────────────────────────────────────────
+on_error() {
+    local exit_code=$? line_no=${1:-?}
+    err "unexpected exit at line $line_no (code $exit_code)"
+    cleanup
+    exit "$exit_code"
+}
+cleanup() {
+    [[ -d "$LOCKDIR" ]] && rmdir "$LOCKDIR" 2>/dev/null || true
+}
+trap 'on_error $LINENO' ERR
+trap cleanup EXIT INT TERM
+
+# ── Usage ─────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+watchdocker $VERSION — sovereign Docker Compose auto-updater
+
+Usage: watchdocker [OPTIONS]
+
+Options:
+  --dry-run           Report what would be done, do not pull or restart
+  --once              Run even if another instance is detected
+  --verbose           Debug-level logging
+  --config <path>     Use specific config file (default: $DEFAULT_CONFIG)
+  --list              Show discovered projects, then exit
+  --version           Print version, exit
+  --help              This help
+
+Config file format (YAML, top-level keys):
+  projects:           # explicit list (skips auto-discover)
+    - /opt/app1
+  skip_projects:      # takes precedence over projects and discover
+    - /opt/app2
+  pre_hook: /path/to/executable    # absolute path, owned by root, +x
+  post_hook: /path/to/executable   # runs only after a successful update
+  prune:
+    enabled: true     # default true; off-switch only
+    age: 168h         # docker --filter until syntax (168h = 7d)
+
+Container-level opt-out:
+  Add label  watchdocker.skip=true  to a container in compose.yml.
+  watchdocker will skip that container's project on the next run.
+
+Exit codes:
+  0   success (no changes OR successful updates)
+  1   one or more projects failed
+  2   config or argument error
+  10  another instance is running (use --once to override)
+EOF
+}
+
+# ── CLI parsing ───────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)  DRY_RUN=1 ;;
+            --once)     FORCE_ONCE=1 ;;
+            --verbose)  VERBOSE=1 ;;
+            --list)     LIST_ONLY=1 ;;
+            --config)
+                [[ $# -ge 2 ]] || { err "--config needs a path"; exit 2; }
+                CONFIG="$2"
+                shift
+                ;;
+            --version)  echo "watchdocker $VERSION"; exit 0 ;;
+            --help|-h)  usage; exit 0 ;;
+            -*)         err "unknown option: $1"; usage >&2; exit 2 ;;
+            *)          err "unexpected argument: $1"; exit 2 ;;
+        esac
+        shift
+    done
+}
+
+# ── Atomic lock via mkdir (mkdir is atomic on POSIX) ──────────────────────
+acquire_lock() {
+    mkdir -p "$(dirname "$LOCKDIR")" 2>/dev/null || true
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+        printf '%d\n' "$$" > "$LOCKDIR/pid"
+        dbg "lock acquired ($LOCKDIR)"
+        return 0
+    fi
+
+    # Lock dir exists. Is the holder still alive?
+    local holder
+    if [[ -r "$LOCKDIR/pid" ]] && holder=$(<"$LOCKDIR/pid") && [[ "$holder" =~ ^[0-9]+$ ]]; then
+        if kill -0 "$holder" 2>/dev/null; then
+            err "another instance is running (pid $holder). use --once to override."
+            return 10
+        fi
+        warn "stale lock from pid $holder, breaking"
+    else
+        warn "lock dir exists but pid file is unreadable, breaking"
+    fi
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR"
+    printf '%d\n' "$$" > "$LOCKDIR/pid"
+    return 0
+}
+
+# ── Hook-path validation (defense-in-depth) ───────────────────────────────
+# Hooks run as root via the systemd unit. A compromised config could point
+# to a writable script. Validate: absolute path, regular file, executable,
+# no path-traversal components, owned by root (when running as root).
+validate_hook() {
+    local hook="$1" kind="$2"
+
+    [[ -z "$hook" ]] && return 0  # empty = not configured = OK
+
+    if [[ "$hook" != /* ]]; then
+        err "$kind path must be absolute: $hook"
+        return 2
+    fi
+    if [[ "$hook" == *".."* ]]; then
+        err "$kind path contains '..': $hook"
+        return 2
+    fi
+    if [[ ! -f "$hook" ]]; then
+        err "$kind not a regular file: $hook"
+        return 2
+    fi
+    if [[ ! -x "$hook" ]]; then
+        err "$kind not executable: $hook"
+        return 2
+    fi
+    if [[ $EUID -eq 0 ]]; then
+        local owner
+        owner=$(stat -c '%U' "$hook" 2>/dev/null || echo "?")
+        if [[ "$owner" != "root" ]]; then
+            err "$kind not owned by root (got: $owner): $hook"
+            return 2
+        fi
+    fi
+    return 0
+}
+
+# ── YAML parser ──────────────────────────────────────────────────────────
+# Minimal subset: top-level keys, lists, nested two-level (prune.*).
+# Handles quoted string values so '#' inside quotes is preserved.
+load_config() {
+    if [[ ! -f "$CONFIG" ]]; then
+        warn "config not found at $CONFIG, using defaults + auto-discover"
+        return 0
+    fi
+    if [[ ! -r "$CONFIG" ]]; then
+        err "config not readable: $CONFIG"
+        return 2
+    fi
+    dbg "loading config: $CONFIG"
+
+    local section="" line raw key val
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        # Strip CR (Windows line endings)
+        raw="${raw%$'\r'}"
+
+        # Strip comment: '#' outside of quoted region
+        line="$(_strip_comment "$raw")"
+
+        # Trim whitespace
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+
+        # Section headers
+        case "$line" in
+            projects:)       section="projects";       continue ;;
+            skip_projects:)  section="skip_projects";  continue ;;
+            prune:)          section="prune";          continue ;;
+        esac
+
+        # List item: "- value"
+        if [[ "$line" == "-"* && -n "$section" ]]; then
+            val="${line#-}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="$(_unquote "$val")"
+            case "$section" in
+                projects)       PROJECTS+=("$val") ;;
+                skip_projects)  SKIP_PROJECTS+=("$val") ;;
+                *)              warn "list item under '$section': $val (ignored)" ;;
+            esac
+            continue
+        fi
+
+        # key: value
+        if [[ "$line" == *":"* ]]; then
+            key="${line%%:*}"
+            val="${line#*:}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="$(_unquote "$val")"
+
+            case "$key" in
+                pre_hook)   PRE_HOOK="$val";  section="" ;;
+                post_hook)  POST_HOOK="$val"; section="" ;;
+                enabled)
+                    if [[ "$section" == "prune" ]]; then
+                        case "${val,,}" in
+                            true|yes|on|1)  PRUNE_ENABLED=1 ;;
+                            false|no|off|0) PRUNE_ENABLED=0 ;;
+                            *) warn "prune.enabled: unrecognized '$val', keeping default" ;;
+                        esac
+                    fi
+                    ;;
+                age)
+                    if [[ "$section" == "prune" ]]; then
+                        if [[ "$val" =~ ^[0-9]+[smhd]$ ]]; then
+                            PRUNE_AGE="$val"
+                        else
+                            warn "prune.age: invalid format '$val', keeping $PRUNE_AGE"
+                        fi
+                    fi
+                    ;;
+                *)
+                    dbg "config: ignored key '$key' under section '${section:-<top>}'"
+                    ;;
+            esac
+            continue
+        fi
+
+        warn "config: unparseable line: $raw"
+    done < "$CONFIG"
+
+    dbg "config loaded: ${#PROJECTS[@]} project(s), ${#SKIP_PROJECTS[@]} skip(s)"
+}
+
+# Strip a trailing '# comment' from a line, but ignore '#' inside "..." or '...'.
+_strip_comment() {
+    local s="$1"
+    local in_dq=0 in_sq=0 out="" i ch
+    for (( i=0; i<${#s}; i++ )); do
+        ch="${s:i:1}"
+        if [[ "$ch" == '"' && $in_sq -eq 0 ]]; then
+            in_dq=$((1 - in_dq))
+        elif [[ "$ch" == "'" && $in_dq -eq 0 ]]; then
+            in_sq=$((1 - in_sq))
+        elif [[ "$ch" == "#" && $in_dq -eq 0 && $in_sq -eq 0 ]]; then
+            break
+        fi
+        out+="$ch"
+    done
+    printf '%s' "$out"
+}
+
+# Remove surrounding "..." or '...' from a value.
+_unquote() {
+    local s="$1"
+    if [[ "$s" == \"*\" && ${#s} -ge 2 ]]; then
+        s="${s:1:-1}"
+    elif [[ "$s" == \'*\' && ${#s} -ge 2 ]]; then
+        s="${s:1:-1}"
+    fi
+    printf '%s' "$s"
+}
+
+# ── Auto-discover compose projects ────────────────────────────────────────
+discover() {
+    local found=() candidates=(/opt /data /srv /home) sd f d
+    for sd in "${candidates[@]}"; do
+        [[ -d "$sd" ]] || continue
+        # -L: follow symlinks once (catches /home/USER/.foo -> /data/foo)
+        while IFS= read -r f; do
+            d=$(dirname "$f")
+            local already=0 s
+            for s in "${found[@]:-}"; do
+                [[ "$s" == "$d" ]] && already=1 && break
+            done
+            (( already )) || found+=("$d")
+        done < <(find -L "$sd" -maxdepth 4 -type f \
+                 \( -name "docker-compose.yml" -o -name "compose.yml" \) \
+                 2>/dev/null)
+    done
+    printf '%s\n' "${found[@]:-}"
+}
+
+# ── Skip-check ────────────────────────────────────────────────────────────
+is_skipped() {
+    local project="$1" s
+    for s in "${SKIP_PROJECTS[@]:-}"; do
+        [[ "$project" == "$s" ]] && return 0
+    done
+
+    # Container-level opt-out: any container in this project carries the
+    # watchdocker.skip=true label.
+    local cid label
+    while IFS= read -r cid; do
+        [[ -z "$cid" ]] && continue
+        label=$(docker inspect "$cid" \
+                --format '{{ index .Config.Labels "watchdocker.skip" }}' 2>/dev/null || echo "")
+        if [[ "$label" == "true" ]]; then
+            dbg "  container $cid has watchdocker.skip=true"
+            return 0
+        fi
+    done < <(cd "$project" 2>/dev/null && docker compose ps --quiet 2>/dev/null || true)
+
+    return 1
+}
+
+# ── Per-project update logic ──────────────────────────────────────────────
+update_project() {
+    local project="$1" project_name
+    project_name=$(basename "$project")
+
+    log "${C_BOLD}▸ $project_name${C_RESET} ($project)"
+
+    if [[ ! -d "$project" ]]; then
+        warn "  project dir not found, skipping"
+        STATS_MISSING=$((STATS_MISSING + 1))
+        return 0
+    fi
+
+    # Require a compose file inside
+    if [[ ! -f "$project/docker-compose.yml" && ! -f "$project/compose.yml" ]]; then
+        warn "  no docker-compose.yml or compose.yml in $project, skipping"
+        STATS_MISSING=$((STATS_MISSING + 1))
+        return 0
+    fi
+
+    if is_skipped "$project"; then
+        log "  ${C_YELLOW}skip${C_RESET} (config or label opt-out)"
+        STATS_SKIPPED=$((STATS_SKIPPED + 1))
+        return 0
+    fi
+
+    if (( DRY_RUN )); then
+        log "  dry-run: would docker compose pull"
+        STATS_DRY=$((STATS_DRY + 1))
+        return 0
+    fi
+
+    # Pull. Capture output; do not mask exit through pipe.
+    local pull_out pull_rc=0
+    pull_out=$(cd "$project" && docker compose pull 2>&1) || pull_rc=$?
+
+    if (( pull_rc != 0 )); then
+        err "  pull failed (rc=$pull_rc):"
+        printf '%s\n' "$pull_out" | sed 's/^/    /' >&2
+        STATS_FAILED=$((STATS_FAILED + 1))
+        return 0  # do not abort the whole run
+    fi
+
+    # Detect "something new pulled" via docker's canonical lines.
+    # New formats: "Pulled" (compose v2), legacy: "Downloaded newer image".
+    if ! grep -qE '(Pulled|Downloaded newer image)' <<<"$pull_out"; then
+        log "  ${C_BLUE}up-to-date${C_RESET}"
+        STATS_UNCHANGED=$((STATS_UNCHANGED + 1))
+        return 0
+    fi
+
+    local pulled_count
+    pulled_count=$(grep -cE '(Pulled|Downloaded newer image)' <<<"$pull_out" || true)
+    log "  ${C_GREEN}updated: $pulled_count image(s)${C_RESET}, restarting…"
+
+    local up_out up_rc=0
+    up_out=$(cd "$project" && docker compose up -d 2>&1) || up_rc=$?
+
+    if (( up_rc != 0 )); then
+        err "  up failed (rc=$up_rc):"
+        printf '%s\n' "$up_out" | sed 's/^/    /' >&2
+        STATS_FAILED=$((STATS_FAILED + 1))
+        return 0
+    fi
+
+    printf '%s\n' "$up_out" | sed 's/^/    /'
+    STATS_UPDATED=$((STATS_UPDATED + 1))
+    return 0
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+
+    if (( FORCE_ONCE == 0 )); then
+        acquire_lock || exit $?
+    else
+        # Override: skip lock entirely, but trap-cleanup still tries to rmdir
+        :
+    fi
+
+    load_config
+
+    validate_hook "$PRE_HOOK"  "pre_hook"  || exit 2
+    validate_hook "$POST_HOOK" "post_hook" || exit 2
+
+    if (( ${#PROJECTS[@]} == 0 )); then
+        log "no projects in config, auto-discovering…"
+        mapfile -t PROJECTS < <(discover)
+    fi
+
+    if (( LIST_ONLY )); then
+        if (( ${#PROJECTS[@]} == 0 )); then
+            echo "no projects discovered"
+            exit 0
+        fi
+        echo "discovered projects:"
+        local p
+        for p in "${PROJECTS[@]}"; do
+            if is_skipped "$p"; then
+                printf "  [skip] %s\n" "$p"
+            else
+                printf "  [act ] %s\n" "$p"
+            fi
+        done
+        exit 0
+    fi
+
+    if (( ${#PROJECTS[@]} == 0 )); then
+        warn "no projects found, nothing to do"
+        exit 0
+    fi
+
+    log "${C_BOLD}watchdocker $VERSION${C_RESET} — ${#PROJECTS[@]} project(s)"
+    (( DRY_RUN )) && log "${C_YELLOW}DRY-RUN MODE${C_RESET}"
+
+    if [[ -n "$PRE_HOOK" ]]; then
+        log "▸ pre-hook: $PRE_HOOK"
+        "$PRE_HOOK" || warn "pre-hook returned non-zero, continuing"
+    fi
+
+    local p
+    for p in "${PROJECTS[@]}"; do
+        update_project "$p" || true
+    done
+
+    if (( PRUNE_ENABLED && DRY_RUN == 0 && STATS_UPDATED > 0 )); then
+        log "▸ pruning images older than $PRUNE_AGE"
+        docker image prune -af --filter "until=$PRUNE_AGE" 2>&1 | tail -2 | sed 's/^/  /'
+    fi
+
+    if [[ -n "$POST_HOOK" ]] && (( STATS_UPDATED > 0 )); then
+        log "▸ post-hook: $POST_HOOK"
+        "$POST_HOOK" || warn "post-hook returned non-zero"
+    fi
+
+    log "${C_BOLD}═══ Summary ═══${C_RESET}"
+    log "  updated:    $STATS_UPDATED"
+    log "  unchanged:  $STATS_UNCHANGED"
+    log "  skipped:    $STATS_SKIPPED"
+    (( STATS_FAILED  > 0 )) && warn "  failed:     $STATS_FAILED"
+    (( STATS_MISSING > 0 )) && warn "  missing:    $STATS_MISSING"
+    (( DRY_RUN ))            && log  "  dry-run:    $STATS_DRY"
+
+    (( STATS_FAILED > 0 )) && exit 1
+    exit 0
+}
+
+main "$@"

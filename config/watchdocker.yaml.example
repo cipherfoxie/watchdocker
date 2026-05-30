@@ -1,0 +1,28 @@
+# watchdocker config — copy to /etc/watchdocker/config.yaml
+#
+# All fields optional. If `projects:` is empty, watchdocker auto-discovers
+# compose-files under /opt, /data, /srv, /home (max depth 4).
+#
+# Container-level opt-out: add label  watchdocker.skip=true  to a container
+# in its compose.yml. That project is skipped on the next run.
+
+# Explicit list of compose-project directories to watch
+projects:
+  - /opt/my-app
+  - /opt/grafana
+  - /data/services/gitea
+
+# Directories to skip (takes precedence over projects and auto-discovery)
+skip_projects:
+  - /opt/experimental
+
+# Optional pre-hook: bash script run BEFORE any pull. Use for backups.
+pre_hook: ""
+
+# Optional post-hook: runs AFTER successful updates only.
+post_hook: ""
+
+# Image cleanup after successful updates
+prune:
+  enabled: true
+  age: 168h          # 7 days

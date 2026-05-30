@@ -1,0 +1,13 @@
+# Local state, never commit
+.env
+*.log
+runs/
+outputs/
+
+# Editor state
+.vscode/.ropeproject/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
