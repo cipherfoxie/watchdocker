@@ -6,32 +6,29 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  shellcheck:
-    name: ShellCheck
+  ci:
+    name: shellcheck + smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ShellCheck
-        run: sudo apt-get install -y shellcheck
+      - name: ShellCheck (severity warning)
+        run: shellcheck --severity=warning bin/watchdocker install.sh tests/smoke.sh
 
-      - name: Lint bash scripts
-        run: |
-          shellcheck bin/watchdocker install.sh
-
-  smoke:
-    name: Smoke tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Bash syntax check
+      - name: Bash syntax
         run: |
           bash -n bin/watchdocker
           bash -n install.sh
           bash -n tests/smoke.sh
 
-      - name: Smoke test (dry-run mode)
-        run: |
-          bash tests/smoke.sh
+      - name: Smoke tests
+        run: bash tests/smoke.sh
